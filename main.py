@@ -11,9 +11,13 @@ KEY_PRESS_DELAY = 0.03
 TAB_PRESS_DELAY = 0.1
 # 手动模式下，终端显示的列表最大长度
 MANUAL_DISPLAY_LIMIT = 20
+# --- 新增：手动模式下字符串截断的长度 ---
+TRUNCATE_FRONT = 20
+TRUNCATE_BACK = 10
 
 # --- 全局状态变量 ---
 manual_paste_index = 0
+manual_page_start_index = 0
 data_to_paste = []
 listener = None
 
@@ -62,11 +66,22 @@ def get_select_all_shortcut():
     return key_map.get(sys.platform, keyboard.Key.ctrl)
 
 
+# --- **新增辅助函数** ---
+def truncate_middle(text: str, front_len: int, back_len: int) -> str:
+    """
+    如果文本长度超过前后长度之和，则在中间截断并用...表示。
+    """
+    text = str(text).replace('\n', ' ').replace('\r', '')
+    if len(text) > front_len + back_len:
+        return f"{text[:front_len]}...{text[-back_len:]}"
+    return text
+
+
 # --- 模式实现 ---
 
-# --- 手动模式 (V2 - 全新UI) ---
+# --- 手动模式 (V4 - 优化字符串显示) ---
 
-def redraw_manual_ui(current_index: int, all_data: list):
+def redraw_manual_ui(page_start_index: int, current_paste_index: int, all_data: list):
     """
     重绘手动模式的用户界面。
     """
@@ -75,19 +90,16 @@ def redraw_manual_ui(current_index: int, all_data: list):
     print(f"--- 按 {trigger_key_name} 键粘贴 | 在此窗口按 Ctrl+C 退出 ---")
     print("-" * 50)
 
-    # 计算要显示的列表切片
-    start_index = current_index
-    end_index = current_index + MANUAL_DISPLAY_LIMIT
-
-    display_list = all_data[start_index:end_index]
+    end_index = page_start_index + MANUAL_DISPLAY_LIMIT
+    display_list = all_data[page_start_index:end_index]
+    marker_pos = current_paste_index - page_start_index
 
     for i, item in enumerate(display_list):
-        # 对要显示的内容进行截断，避免过长
-        display_item = str(item).replace('\n', ' ').replace('\r', '')
-        if len(display_item) > 60:
-            display_item = display_item[:57] + "..."
+        # --- **核心修改点** ---
+        # 使用新的截断函数来格式化显示内容
+        display_item = truncate_middle(item, TRUNCATE_FRONT, TRUNCATE_BACK)
 
-        if i == 0:  # 当前要粘贴的项
+        if i == marker_pos:
             print(f">>> {display_item}")
         else:
             print(f"    {display_item}")
@@ -95,7 +107,7 @@ def redraw_manual_ui(current_index: int, all_data: list):
 
 def on_press_manual(key):
     """手动模式下的按键监听回调函数"""
-    global manual_paste_index, listener
+    global manual_paste_index, listener, manual_page_start_index
 
     if key == TRIGGER_KEY:
         if manual_paste_index < len(data_to_paste):
@@ -114,12 +126,13 @@ def on_press_manual(key):
 
             # 2. 检查是否完成
             if manual_paste_index < len(data_to_paste):
-                # 用户要求：当粘贴到第15个时清屏刷新
-                # 我们的实现是每次都刷新，当列表滚动时自然就实现了这个效果
-                # 为了完全符合要求，我们可以在特定位置强制刷新
-                # (current_index % 15 == 0 and current_index > 0)
-                # 但每次刷新是更流畅的体验，这里我们保持每次刷新
-                redraw_manual_ui(manual_paste_index, data_to_paste)
+                progress_on_page = manual_paste_index - manual_page_start_index
+                refresh_threshold = int(MANUAL_DISPLAY_LIMIT * 0.75)
+
+                if progress_on_page >= refresh_threshold:
+                    manual_page_start_index = manual_paste_index
+
+                redraw_manual_ui(manual_page_start_index, manual_paste_index, data_to_paste)
             else:
                 clear_screen()
                 print("\n所有项目已粘贴完毕！")
@@ -130,24 +143,24 @@ def on_press_manual(key):
 
 def run_manual_mode():
     """执行手动粘贴模式"""
-    global listener
+    global listener, manual_paste_index, manual_page_start_index
     if not data_to_paste:
         print("没有可粘贴的数据。")
         return
 
-    # 初始绘制UI
-    redraw_manual_ui(0, data_to_paste)
+    manual_paste_index = 0
+    manual_page_start_index = 0
 
-    # 创建并启动监听器
+    redraw_manual_ui(manual_page_start_index, manual_paste_index, data_to_paste)
+
     listener = keyboard.Listener(on_press=on_press_manual)
     listener.start()
-    listener.join()  # 阻塞主线程直到监听器停止
+    listener.join()
 
 
 # --- TAB 模式 ---
 def run_tab_mode():
     """执行自动 TAB 粘贴模式"""
-    # 1. 获取用户参数 (带默认值)
     delete_first_input = input("是否在每次粘贴前删除输入框内的原有内容? (y/n) [默认: n]: ").lower() or 'n'
     delete_first = delete_first_input == 'y'
 
@@ -224,7 +237,6 @@ def main():
     display_data(df)
     data_to_paste = [item for sublist in df.values.tolist() for item in sublist if pd.notna(item)]
 
-    # 选择模式 (带默认值)
     while True:
         mode = input(
             "请选择操作模式:\n  1. 手动模式 (逐个粘贴)\n  2. TAB 模式 (自动跳格粘贴)\n请输入选项 [默认: 1]: ") or '1'
