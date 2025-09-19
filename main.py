@@ -6,19 +6,15 @@ import os
 from pynput import keyboard
 
 # --- 全局配置常量 ---
-# 推荐使用 F1-F12 功能键, 'f9' 表示 F9 键
 TRIGGER_KEY = keyboard.Key.f9
-
-# 模拟按键之间的延迟时间（秒），防止目标程序反应不过来
-KEY_PRESS_DELAY = 0.1
-TAB_PRESS_DELAY = 0.2
+KEY_PRESS_DELAY = 0.03
+TAB_PRESS_DELAY = 0.1
+# 手动模式下，终端显示的列表最大长度
+MANUAL_DISPLAY_LIMIT = 20
 
 # --- 全局状态变量 ---
-# 用于手动模式下追踪当前粘贴项的索引
 manual_paste_index = 0
-# 用于存储待粘贴的数据列表
 data_to_paste = []
-# 键盘监听器对象
 listener = None
 
 
@@ -33,7 +29,6 @@ def get_data_from_clipboard() -> pd.DataFrame | None:
     如果失败则返回 None。
     """
     try:
-        # 使用 pandas 读取，它可以很好地处理 Excel 的制表符分隔格式
         df = pd.read_clipboard(header=None, sep='\t')
         if df.empty:
             print("错误：剪贴板为空或格式不正确。")
@@ -57,10 +52,7 @@ def display_data(df: pd.DataFrame):
 
 def get_paste_shortcut():
     """根据操作系统返回正确的粘贴快捷键组合"""
-    # 对于 pynput, 特殊键需要是 Key 枚举或 a-z 字符
-    # 'cmd' 是 mac 的 command 键
     key_map = {'win32': keyboard.Key.ctrl, 'darwin': keyboard.Key.cmd}
-    # 默认使用 ctrl
     return key_map.get(sys.platform, keyboard.Key.ctrl)
 
 
@@ -72,7 +64,35 @@ def get_select_all_shortcut():
 
 # --- 模式实现 ---
 
-# --- 手动模式 ---
+# --- 手动模式 (V2 - 全新UI) ---
+
+def redraw_manual_ui(current_index: int, all_data: list):
+    """
+    重绘手动模式的用户界面。
+    """
+    clear_screen()
+    trigger_key_name = str(TRIGGER_KEY).split('.')[-1].upper()
+    print(f"--- 按 {trigger_key_name} 键粘贴 | 在此窗口按 Ctrl+C 退出 ---")
+    print("-" * 50)
+
+    # 计算要显示的列表切片
+    start_index = current_index
+    end_index = current_index + MANUAL_DISPLAY_LIMIT
+
+    display_list = all_data[start_index:end_index]
+
+    for i, item in enumerate(display_list):
+        # 对要显示的内容进行截断，避免过长
+        display_item = str(item).replace('\n', ' ').replace('\r', '')
+        if len(display_item) > 60:
+            display_item = display_item[:57] + "..."
+
+        if i == 0:  # 当前要粘贴的项
+            print(f">>> {display_item}")
+        else:
+            print(f"    {display_item}")
+
+
 def on_press_manual(key):
     """手动模式下的按键监听回调函数"""
     global manual_paste_index, listener
@@ -81,11 +101,9 @@ def on_press_manual(key):
         if manual_paste_index < len(data_to_paste):
             current_item = str(data_to_paste[manual_paste_index])
 
-            # 1. 将当前项放入剪贴板
+            # 1. 粘贴操作
             pyperclip.copy(current_item)
-            time.sleep(KEY_PRESS_DELAY)  # 等待剪贴板稳定
-
-            # 2. 模拟粘贴
+            time.sleep(KEY_PRESS_DELAY)
             kb_controller = keyboard.Controller()
             modifier_key = get_paste_shortcut()
             with kb_controller.pressed(modifier_key):
@@ -94,15 +112,18 @@ def on_press_manual(key):
 
             manual_paste_index += 1
 
-            # 3. 更新提示
+            # 2. 检查是否完成
             if manual_paste_index < len(data_to_paste):
-                next_item = str(data_to_paste[manual_paste_index])
-                # 使用 \r 实现原地更新，避免刷屏
-                sys.stdout.write(f"\r准备粘贴: [{next_item[:20]}]... 按 F9 继续。")
-                sys.stdout.flush()
+                # 用户要求：当粘贴到第15个时清屏刷新
+                # 我们的实现是每次都刷新，当列表滚动时自然就实现了这个效果
+                # 为了完全符合要求，我们可以在特定位置强制刷新
+                # (current_index % 15 == 0 and current_index > 0)
+                # 但每次刷新是更流畅的体验，这里我们保持每次刷新
+                redraw_manual_ui(manual_paste_index, data_to_paste)
             else:
-                print("\n\n所有项目已粘贴完毕！")
-                listener.stop()  # 停止监听
+                clear_screen()
+                print("\n所有项目已粘贴完毕！")
+                listener.stop()
         else:
             listener.stop()
 
@@ -110,15 +131,12 @@ def on_press_manual(key):
 def run_manual_mode():
     """执行手动粘贴模式"""
     global listener
-    print("--- 手动模式 ---")
-    print(f"请将光标移动到目标位置，每按一次 '{str(TRIGGER_KEY).split('.')[-1].upper()}' 键将粘贴一个项目。")
-
     if not data_to_paste:
         print("没有可粘贴的数据。")
         return
 
-    first_item = str(data_to_paste[0])
-    print(f"准备粘贴: [{first_item[:20]}]...")
+    # 初始绘制UI
+    redraw_manual_ui(0, data_to_paste)
 
     # 创建并启动监听器
     listener = keyboard.Listener(on_press=on_press_manual)
@@ -129,13 +147,14 @@ def run_manual_mode():
 # --- TAB 模式 ---
 def run_tab_mode():
     """执行自动 TAB 粘贴模式"""
-    # 1. 获取用户参数
-    delete_first_input = input("是否在每次粘贴前删除输入框内的原有内容? (y/n) [默认: n]: ").lower()
+    # 1. 获取用户参数 (带默认值)
+    delete_first_input = input("是否在每次粘贴前删除输入框内的原有内容? (y/n) [默认: n]: ").lower() or 'n'
     delete_first = delete_first_input == 'y'
 
     while True:
+        tab_count_str = input("请输入每次粘贴后需要按下的 TAB 键次数 [默认: 1]: ") or '1'
         try:
-            tab_count = int(input("请输入每次粘贴后需要按下的 TAB 键次数 (例如: 1): "))
+            tab_count = int(tab_count_str)
             if tab_count >= 0:
                 break
             else:
@@ -143,18 +162,17 @@ def run_tab_mode():
         except ValueError:
             print("无效输入，请输入一个数字。")
 
+    trigger_key_name = str(TRIGGER_KEY).split('.')[-1].upper()
     print("\n--- TAB 模式 ---")
-    print(f"请将光标移动到起始位置，然后按一次 '{str(TRIGGER_KEY).split('.')[-1].upper()}' 键开始全自动粘贴。")
+    print(f"请将光标移动到起始位置，然后按一次 '{trigger_key_name}' 键开始全自动粘贴。")
 
-    # 使用一个简单的监听器来触发整个流程
     def on_press_start_auto(key):
         if key == TRIGGER_KEY:
-            return False  # 返回 False 来停止监听器
+            return False
 
     with keyboard.Listener(on_press=on_press_start_auto) as start_listener:
         start_listener.join()
 
-    # 监听器已停止，开始执行自动化粘贴
     print("\n开始自动粘贴...")
     kb_controller = keyboard.Controller()
     modifier_key_paste = get_paste_shortcut()
@@ -163,7 +181,6 @@ def run_tab_mode():
     for i, item in enumerate(data_to_paste):
         current_item = str(item)
 
-        # 1. (可选) 删除原有内容
         if delete_first:
             with kb_controller.pressed(modifier_key_select):
                 kb_controller.press('a')
@@ -173,7 +190,6 @@ def run_tab_mode():
             kb_controller.release(keyboard.Key.delete)
             time.sleep(KEY_PRESS_DELAY)
 
-        # 2. 粘贴
         pyperclip.copy(current_item)
         time.sleep(KEY_PRESS_DELAY)
         with kb_controller.pressed(modifier_key_paste):
@@ -183,7 +199,6 @@ def run_tab_mode():
         print(f"  > 已粘贴: {current_item[:30]}")
         time.sleep(TAB_PRESS_DELAY)
 
-        # 3. 按 TAB，如果不是最后一项
         if i < len(data_to_paste) - 1:
             for _ in range(tab_count):
                 kb_controller.press(keyboard.Key.tab)
@@ -201,27 +216,23 @@ def main():
     print("欢迎使用 Excel 区域智能粘贴工具！")
     print("------------------------------------")
 
-    # 1. 读取数据
     df = get_data_from_clipboard()
     if df is None:
         input("\n按 Enter 键退出。")
         return
 
-    # 2. 展示数据
     display_data(df)
+    data_to_paste = [item for sublist in df.values.tolist() for item in sublist if pd.notna(item)]
 
-    # 将 DataFrame 展平为列表，按行优先
-    data_to_paste = [item for sublist in df.values.tolist() for item in sublist]
-
-    # 3. 选择模式
+    # 选择模式 (带默认值)
     while True:
-        mode = input("请选择操作模式:\n  1. 手动模式 (逐个粘贴)\n  2. TAB 模式 (自动跳格粘贴)\n请输入选项 (1/2): ")
+        mode = input(
+            "请选择操作模式:\n  1. 手动模式 (逐个粘贴)\n  2. TAB 模式 (自动跳格粘贴)\n请输入选项 [默认: 1]: ") or '1'
         if mode in ['1', '2']:
             break
         else:
             print("无效输入，请输入 1 或 2。")
 
-    # 4. 执行对应模式
     if mode == '1':
         run_manual_mode()
     elif mode == '2':
